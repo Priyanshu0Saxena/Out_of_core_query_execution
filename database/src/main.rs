@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+\use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::Query;
 use db_config::DbContext;
@@ -7,10 +7,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use crate::{
     cli::CliOptions,
     io_setup::{setup_disk_io, setup_monitor_io},
+    block_interface::BlockInterface,
+    executor::execute,
+    output::send_results,
 };
 
 mod cli;
 mod io_setup;
+mod block_interface;  // NEW
+mod executor;         // NEW
+mod output;           // NEW
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -83,6 +89,24 @@ fn db_main() -> Result<()> {
     monitor_out.write_all("!\n".as_bytes())?;
     monitor_out.flush()?;
     */
+
+    // NEW: Create block interface using already fetched block_size
+    let mut block_interface = BlockInterface::new(
+        &mut disk_buf_reader,
+        &mut disk_out,
+        block_size,
+        memory_limit_mb as u64,
+    )?;
+
+    // NEW: Execute the query tree recursively
+    let result_rows = execute(
+        &query.root,
+        &ctx,
+        &mut block_interface,
+    )?;
+
+    // NEW: Send results to monitor
+    send_results(result_rows, &mut monitor_out)?;
 
     Ok(())
 }
