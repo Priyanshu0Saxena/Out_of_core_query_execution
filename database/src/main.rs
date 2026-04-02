@@ -19,6 +19,10 @@ mod executor;         // NEW
 mod output;           // NEW
 
 fn db_main() -> Result<()> {
+    // Debug: write to /dev/tty to trace execution regardless of stdout/stderr routing
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(b"[DB] db_main started\n");
+    }
     let cli_options = CliOptions::parse();
 
     // Use the ctx to the tables and stats
