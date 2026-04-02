@@ -1,4 +1,4 @@
-\use anyhow::{Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::Query;
 use db_config::DbContext;
@@ -35,6 +35,7 @@ fn db_main() -> Result<()> {
         println!();
     }
 
+    eprintln!("[DB] setting up io");
     // Setups and provides handler to talk with disk and monitor
     let (disk_in, mut disk_out) = setup_disk_io();
     let (monitor_in, mut monitor_out) = setup_monitor_io();
@@ -46,6 +47,7 @@ fn db_main() -> Result<()> {
     // Temporary variable to read a line of input
     let mut input_line = String::new();
 
+    eprintln!("[DB] reading query from monitor");
     // Read query form monitor
     monitor_buf_reader.read_line(&mut input_line)?;
     let query: Query = serde_json::from_str(&input_line).unwrap();
@@ -53,6 +55,7 @@ fn db_main() -> Result<()> {
 
     // Interacting with with Disk
 
+    eprintln!("[DB] got query, asking disk for block-size");
     // Get block size
     disk_out.write_all("get block-size\n".as_bytes())?;
     disk_out.flush()?;
@@ -74,6 +77,7 @@ fn db_main() -> Result<()> {
         String::from_utf8_lossy(&buf[..50])
     );
 
+    eprintln!("[DB] read block 0, asking monitor for memory limit");
     // Get memory limit from monitor
     input_line.clear();
     monitor_out.write_all("get_memory_limit\n".as_bytes())?;
@@ -90,6 +94,7 @@ fn db_main() -> Result<()> {
     monitor_out.flush()?;
     */
 
+    eprintln!("[DB] got memory limit {memory_limit_mb}, creating block interface");
     // NEW: Create block interface using already fetched block_size
     let mut block_interface = BlockInterface::new(
         &mut disk_buf_reader,
@@ -98,6 +103,7 @@ fn db_main() -> Result<()> {
         memory_limit_mb as u64,
     )?;
 
+    eprintln!("[DB] block interface ready, executing query");
     // NEW: Execute the query tree recursively
     let result_rows = execute(
         &query.root,
@@ -105,6 +111,7 @@ fn db_main() -> Result<()> {
         &mut block_interface,
     )?;
 
+    eprintln!("[DB] query done ({} rows), sending results", result_rows.len());
     // NEW: Send results to monitor
     send_results(result_rows, &mut monitor_out)?;
 

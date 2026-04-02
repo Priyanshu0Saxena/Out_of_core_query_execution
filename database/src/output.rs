@@ -1,19 +1,37 @@
-// Format and send results to monitor
-// Take final rows and send them to monitor in correct format
+// Format and send result rows to the monitor.
+// Protocol: "validate\n"  →  one "v1|v2|...|vN|\n" per row  →  "!\n"
+
 use anyhow::Result;
 use std::io::Write;
 use common::Data;
 use crate::executor::Row;
 
-/// Sends all result rows to monitor in correct format
+/// Send all result rows to the monitor in the expected wire format.
 pub fn send_results(rows: Vec<Row>, monitor_out: &mut impl Write) -> Result<()> {
-    // Send validate signal
-    // For each row send col1|col2|col3|\n
-    // Send ! to signal end
-    todo!()
+    monitor_out.write_all(b"validate\n")?;
+    monitor_out.flush()?;
+
+    for row in rows {
+        let mut line = String::new();
+        for (_, value) in &row {
+            line.push_str(&format_value(value));
+            line.push('|');
+        }
+        line.push('\n');
+        monitor_out.write_all(line.as_bytes())?;
+    }
+
+    monitor_out.write_all(b"!\n")?;
+    monitor_out.flush()?;
+    Ok(())
 }
 
-/// Format a single Data value as a string
 fn format_value(value: &Data) -> String {
-    todo!()
+    match value {
+        Data::Int32(v) => v.to_string(),
+        Data::Int64(v) => v.to_string(),
+        Data::Float32(v) => v.to_string(),
+        Data::Float64(v) => v.to_string(),
+        Data::String(v) => v.clone(),
+    }
 }
