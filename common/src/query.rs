@@ -5,7 +5,7 @@ pub struct Query {
     pub root: QueryOp,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ComparisionOperator {
     EQ,
     NE,
@@ -15,7 +15,7 @@ pub enum ComparisionOperator {
     LTE,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ComparisionValue {
     Column(String),
     I32(i32),
@@ -25,7 +25,7 @@ pub enum ComparisionValue {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Predicate {
     pub column_name: String,
     pub operator: ComparisionOperator,
@@ -50,7 +50,7 @@ pub struct CrossData {
     pub right: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortSpec {
     pub column_name: String,
     pub ascending: bool,
