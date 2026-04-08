@@ -22,6 +22,7 @@ use crate::{
     cli::CliOptions,
     executor::build_plan,
     io_setup::{setup_disk_io, setup_monitor_io},
+    optimizer::optimize,
     output::stream_results,
 };
 
@@ -29,6 +30,7 @@ mod block_interface;
 mod cli;
 mod executor;
 mod io_setup;
+mod optimizer;
 mod output;
 
 fn db_main() -> Result<()> {
@@ -40,11 +42,14 @@ fn db_main() -> Result<()> {
     //   disk_in  / disk_out   → FD 3/4 (disk simulator)
     //   monitor_in / monitor_out → FD 5/6 (monitor)
     let (disk_in, mut disk_out) = setup_disk_io();
-    let (monitor_in, mut monitor_out) = setup_monitor_io();
+    let (monitor_in, monitor_out_raw) = setup_monitor_io();
 
     // Wrap disk_in in a BufReader for line-by-line text reads
     let mut disk_reader = BufReader::new(disk_in);
     let mut monitor_reader = BufReader::new(monitor_in);
+    // Wrap monitor_out in a BufWriter to batch small writes (validate, row lines, "!")
+    // into larger OS write() calls, reducing syscall overhead on large result sets.
+    let mut monitor_out = std::io::BufWriter::new(monitor_out_raw);
 
     let mut line = String::new();
 
@@ -78,8 +83,9 @@ fn db_main() -> Result<()> {
     // It also queries the disk for anon-start-block internally.
     let mut bi = BlockInterface::new(disk_reader, disk_out, block_size, memory_limit_mb)?;
 
-    // ── Step 7: Build the execution plan tree (no disk I/O yet) ──────────────
-    let mut plan = build_plan(&query.root, &ctx)?;
+    // ── Step 7: Optimize the query tree, then build the execution plan ───────
+    let optimized = optimize(query.root, &ctx);
+    let mut plan = build_plan(&optimized, &ctx, memory_limit_mb)?;
 
     // ── Step 8: Execute and stream results to the monitor ─────────────────────
     stream_results(&mut plan, &mut bi, &mut monitor_out)?;
