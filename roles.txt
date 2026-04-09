@@ -1,0 +1,137 @@
+Act as an experienced Rust developer and mentor.
+Review the entire database design and codebase from scratch, strictly following the instructions in `Assignment_instructions.txt`.
+Follow this workflow **without deviation**: if already implemented Review it and make changes if needed.
+### Step 1: Basic Implementation (Mandatory First Step)
+* Implement only the **core functionality** required by the assignment.
+* Do **not** optimize, generalize, or add extra features.
+* Keep the logic **as simple as possible**, even if it is not the most efficient.
+* Avoid advanced Rust features (e.g., lifetimes complexity, macros, heavy generics) unless absolutely necessary.
+### Step 2: Code Style Requirements
+* Write **beginner-friendly Rust code**.
+* Use clear variable names and simple control flow.
+* Break code into small, understandable functions.
+* Add comments explaining *what* and *why*, not just *how*.
+* clealy seperate role of Buffer-manager , executor, output generator, query-optimizer(simple push projection up, filter down + joins)
+* implement most basic implementation first for all operations so guaranteed run of queries
+* clearn buffer-manager with cloak and strict memory limits as per query requirements
+* implement materialized as well as volcano model for optimizations
+* implement cross , filter, project
+* implement sort - external merge-sort
+* implement joins - hash-join,sort-merge,Block-nested Loop join
+* implement scan - Index , filescan
+
+### Step 3: Constraints (Very Important)
+* Do NOT overengineer the solution.
+* Do NOT introduce complex design patterns.
+* Do NOT optimize prematurely.
+* Do NOT assume future requirements.
+### Step 4: Iterative Improvement Plan
+* After completing the basic version, clearly list components that can be improved.
+* Wait for further instructions before optimizing or refactoring.
+The goal is to first build a **minimal, correct, and easy-to-understand implementation**, and then improve it step by step in later iterations.
+
+================================================================================
+COMPONENT ROLES — STRICT BOUNDARIES
+================================================================================
+
+Each component owns exactly one concern. Do NOT let logic bleed across boundaries.
+
+BLOCK INTERFACE  (database/src/block_interface.rs)
+--------------------------------------------------
+Role: The ONLY code that talks to the disk simulator (FD 3 / FD 4).
+Owns:
+  - Reading blocks from disk (get block command)
+  - Writing scratch blocks to disk (put block command)
+  - Querying file metadata (start-block, num-blocks)
+  - LRU buffer pool for read-only (file) blocks
+  - Scratch block allocation with free list (alloc_scratch / free_scratch_block)
+Does NOT:
+  - Know about rows, columns, or data types
+  - Make decisions about WHEN to read or write
+  - Know anything about query execution
+Memory responsibility:
+  - LRU cache: capacity = (memory_limit_mb × 1MB) / block_size / 8
+    → ~12.5% of the process RAM budget. Clamped to [16, 4096] blocks.
+  - Scratch IDs given out consume NO process RAM (simulator holds the data).
+  - BUT each unique scratch block ID ever written costs block_size bytes of
+    DISK SIMULATOR RAM (sparse — unwritten IDs are free). This is also bounded
+    and must be treated as a limited resource.
+Scratch space rule:
+  - Freed blocks MUST be returned via free_scratch_block() so alloc_scratch()
+    can reuse them. Without reuse, every sort pass mints new IDs → simulator OOM.
+  - Peak scratch ≈ 2 × (largest active run) during merge, since source runs
+    are freed immediately after being merged into the output run.
+  - RunMeta stores Vec<u64> of block IDs (not start+offset) so non-contiguous
+    IDs from the free list work correctly. RunReader indexes by block_ids[offset].
+  - Do NOT revert to start+offset addressing — it silently corrupts data when
+    the free list returns non-contiguous blocks.
+
+EXECUTOR  (database/src/executor.rs)
+-------------------------------------
+Role: Implements the Volcano iterator model. Each operator is a RowIter that
+      yields one row at a time via next_row(&mut BlockInterface).
+Owns:
+  - Scan     — reads rows from disk file blocks one block at a time
+  - Filter   — passes rows satisfying all predicates (AND)
+  - Project  — selects and renames a column subset, preserves order
+  - Sort     — external merge sort: chunks sorted in memory, runs on scratch disk,
+               pairwise merge until one run remains
+  - Cross    — right side spilled to scratch disk, re-scanned per left row
+  - HashJoin — right side in hash table (RAM); falls back to SMJoin when
+               estimated right cardinality × 512 bytes > memory limit
+  - BNLJoin  — right side spilled to scratch disk; used for non-equi joins
+  - SMJoin   — sort-merge join; requires both inputs sorted on join key.
+               Buffers one matching key group per side (left_group, right_group).
+               Memory = O(size of largest duplicate key group), not O(block_size).
+               For primary-key joins this is O(1); degenerate many-duplicate keys
+               could be large but that is acceptable — no fix without major redesign.
+  - build_plan() — builds RowIter tree from QueryOp tree (no I/O here)
+Does NOT:
+  - Talk to disk directly (always via BlockInterface)
+  - Parse queries or choose join strategies (that is optimizer's job)
+Key rules:
+  - RunWriter calls bi.alloc_scratch() per block and records each returned ID in
+    RunMeta.block_ids. IDs may be non-contiguous (free list reuse).
+  - RunReader indexes by block_ids[offset], never by start_block + offset.
+  - After merging two runs, free all their block IDs via bi.free_scratch_block()
+    so the disk simulator's RAM stays bounded (reuse = bounded scratch space).
+  - Right-side materialisation (Cross, BNL, Hash) MUST spill to disk, never
+    hold unbounded RAM. Cross and BNL always write to scratch. Hash falls back
+    to SMJ when build side is too large.
+
+OPTIMIZER  (database/src/optimizer.rs)
+---------------------------------------
+Role: Rewrites the QueryOp tree before build_plan to reduce I/O and CPU.
+Owns:
+  - Filter pushdown through Cross, Filter, Project
+  - Join selection: build_join() in executor converts Filter(Cross) into the
+    right join operator (Hash → SMJ fallback → BNL)
+  - Ordered-scan early stop: LT/LTE predicates on IsPhysicallyOrdered columns
+    are pushed into ScanIter.early_stop_preds
+  - schema_of() helper: computes column names for any QueryOp without I/O
+Does NOT:
+  - Execute anything (no bi calls)
+  - Reorder joins (no join reordering beyond predicate pushdown)
+Key rule: optimizer only rewrites the QueryOp tree. All physical decisions
+  (which join algorithm, sort chunk size) happen in build_plan, not here.
+
+OUTPUT  (database/src/output.rs)
+----------------------------------
+Role: Drives the root RowIter and streams formatted rows to the monitor.
+Owns:
+  - Monitor wire protocol: validate\n → rows → !\n
+  - Row formatting: integers as decimal, floats as SQLite-style %g, strings as-is
+  - Pipe-delimited output with trailing pipe per row
+Does NOT:
+  - Know about blocks or disk
+  - Buffer all rows (streams one at a time)
+
+MAIN  (database/src/main.rs)
+------------------------------
+Role: Startup wiring only.
+Owns:
+  - Read query JSON from monitor (FD 5)
+  - Query block size from disk, memory limit from monitor
+  - Construct BlockInterface, run optimizer, call build_plan, call stream_results
+Does NOT:
+  - Contain any query logic
