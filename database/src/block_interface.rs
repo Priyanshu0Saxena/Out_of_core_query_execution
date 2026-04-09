@@ -23,7 +23,8 @@
 ///   When the cache is full the least-recently-used block is evicted.
 ///   Scratch blocks are NOT cached (they are written once, read rarely, and
 ///   caching them would waste memory).
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 
 use anyhow::Result;
@@ -41,7 +42,7 @@ pub struct BlockInterface<R: BufRead, W: Write> {
     pub block_size: usize,
     /// The first block ID in the anonymous (scratch) region
     pub anon_start: u64,
-    /// The next free block ID for scratch allocation
+    /// Next fresh scratch block ID (used when free list is empty).
     next_anon: u64,
 
     // ── LRU Buffer Pool ────────────────────────────────────────────────────
@@ -53,10 +54,10 @@ pub struct BlockInterface<R: BufRead, W: Write> {
     cache_capacity: usize,
 
     // ── Scratch block free list ────────────────────────────────────────────
-    /// Freed scratch ranges: (start_block, num_blocks).
-    /// When the sort merges two runs into one it frees the two source runs.
-    /// alloc_scratch() consults this list before bumping next_anon.
-    free_scratch: Vec<(u64, u64)>,
+    /// Individual scratch block IDs that have been freed and can be reused.
+    /// Using a free list limits the number of unique block IDs ever touched,
+    /// keeping the disk simulator's memory footprint bounded.
+    free_scratch: Vec<u64>,
 }
 
 impl<R: BufRead, W: Write> BlockInterface<R, W> {
@@ -167,33 +168,27 @@ impl<R: BufRead, W: Write> BlockInterface<R, W> {
 
     // ─── Scratch (anonymous) region ────────────────────────────────────────────
 
-    /// Allocate `n` contiguous scratch blocks. Returns the starting block ID.
+    /// Allocate one scratch block and return its ID.
     ///
-    /// Checks the free list first; if a previously freed range of exactly `n`
-    /// blocks exists, it is reused.  Otherwise bumps `next_anon`.
-    pub fn alloc_scratch(&mut self, n: u64) -> u64 {
-        // Look for a free range of at least n blocks; split if larger.
-        if let Some(pos) = self.free_scratch.iter().position(|&(_, count)| count >= n) {
-            let (start, count) = self.free_scratch.swap_remove(pos);
-            if count > n {
-                self.free_scratch.push((start + n, count - n));
-            }
-            return start;
+    /// Reuses a previously freed block if one is available; otherwise bumps
+    /// `next_anon`. Reuse keeps the total number of unique block IDs small,
+    /// which bounds the disk simulator's RAM footprint.
+    ///
+    /// Callers (RunWriter) store every returned ID explicitly in RunMeta, so
+    /// non-contiguous IDs are handled correctly — RunReader looks up each block
+    /// by ID, it does NOT assume start_block + offset contiguity.
+    pub fn alloc_scratch(&mut self) -> u64 {
+        if let Some(id) = self.free_scratch.pop() {
+            return id;
         }
-        // Fall back to fresh allocation.
-        let start = self.next_anon;
-        self.next_anon += n;
-        start
+        let id = self.next_anon;
+        self.next_anon += 1;
+        id
     }
 
-    /// Return a scratch range to the free list so it can be reused later.
-    ///
-    /// Called by the sort's merge phase after two source runs have been
-    /// merged into a single output run and the inputs are no longer needed.
-    pub fn free_scratch_range(&mut self, start: u64, num_blocks: u64) {
-        if num_blocks > 0 {
-            self.free_scratch.push((start, num_blocks));
-        }
+    /// Return a scratch block to the free list so it can be reused.
+    pub fn free_scratch_block(&mut self, block_id: u64) {
+        self.free_scratch.push(block_id);
     }
 
     /// Write `data` to scratch blocks starting at `block_id`.
@@ -201,6 +196,8 @@ impl<R: BufRead, W: Write> BlockInterface<R, W> {
     /// Scratch blocks are NOT added to the LRU cache — they are write-once
     /// (used for external sort runs) and reading them later is handled by
     /// RunReader which issues regular disk reads.
+    
+    
     pub fn write_scratch(&mut self, block_id: u64, data: &[u8]) -> Result<()> {
         debug_assert!(
             data.len() % self.block_size == 0,

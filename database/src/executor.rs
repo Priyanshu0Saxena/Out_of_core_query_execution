@@ -385,10 +385,19 @@ fn make_sort_iter(child: RowIter, sort_specs: Vec<SortSpec>, memory_limit_mb: u6
 }
 
 /// Metadata describing a sorted run stored on scratch disk.
+///
+/// Stores the actual block IDs (not start+offset) so that non-contiguous
+/// allocations from the free list work correctly.
 #[derive(Clone)]
 struct RunMeta {
-    start_block: u64,
-    num_blocks: u64,
+    /// Ordered list of scratch block IDs that make up this run.
+    block_ids: Vec<u64>,
+}
+
+impl RunMeta {
+    fn is_empty(&self) -> bool {
+        self.block_ids.is_empty()
+    }
 }
 
 /// SortIter uses external merge sort so it can handle data larger than memory.
@@ -512,10 +521,10 @@ impl SortIter {
                         &self.schema,
                         bi,
                     )?;
-                    // Return the two source scratch ranges to the free list so
-                    // subsequent merges in this round can reuse the blocks.
-                    bi.free_scratch_range(run_a.start_block, run_a.num_blocks);
-                    bi.free_scratch_range(run_b.start_block, run_b.num_blocks);
+                    // Return all source blocks to the free list so they can be
+                    // reused by subsequent merge rounds or other operators.
+                    for &id in &run_a.block_ids { bi.free_scratch_block(id); }
+                    for &id in &run_b.block_ids { bi.free_scratch_block(id); }
                     merged_runs.push(m);
                     i += 2;
                 } else {
@@ -631,10 +640,10 @@ fn compare_rows(a: &Row, b: &Row, sort_specs: &[SortSpec], schema: &[String]) ->
 ///   [row1 bytes][row2 bytes]...[padding][row_count_low][row_count_high]
 struct RunWriter {
     block_size: usize,
-    start_block: Option<u64>, // set when the first block is flushed
-    blocks_written: u64,
+    /// Actual block IDs allocated for this run (may be non-contiguous).
+    block_ids: Vec<u64>,
     current_block: Vec<u8>,
-    byte_pos: usize, // bytes used so far in current_block (not counting 2-byte footer)
+    byte_pos: usize,
     rows_in_current: u16,
 }
 
@@ -642,8 +651,7 @@ impl RunWriter {
     fn new(block_size: usize) -> Self {
         Self {
             block_size,
-            start_block: None,
-            blocks_written: 0,
+            block_ids: Vec::new(),
             current_block: vec![0u8; block_size],
             byte_pos: 0,
             rows_in_current: 0,
@@ -685,30 +693,25 @@ impl RunWriter {
         self.current_block[bs - 2] = (self.rows_in_current & 0xFF) as u8;
         self.current_block[bs - 1] = ((self.rows_in_current >> 8) & 0xFF) as u8;
 
-        let block_id = bi.alloc_scratch(1);
-        if self.start_block.is_none() {
-            self.start_block = Some(block_id);
-        }
+        // alloc_scratch reuses freed blocks — record the actual ID so RunReader
+        // can find it regardless of whether it is contiguous with the previous one.
+        let block_id = bi.alloc_scratch();
+        self.block_ids.push(block_id);
         bi.write_scratch(block_id, &self.current_block)?;
-        self.blocks_written += 1;
 
-        // Reset for the next block
         self.current_block.fill(0);
         self.byte_pos = 0;
         self.rows_in_current = 0;
         Ok(())
     }
 
-    /// Flush any remaining rows and return the RunMeta describing the written run.
+    /// Flush remaining rows and return the RunMeta with all block IDs.
     fn finish<R: BufRead, W: Write>(
         mut self,
         bi: &mut BlockInterface<R, W>,
     ) -> Result<RunMeta> {
         self.flush_block(bi)?;
-        Ok(RunMeta {
-            start_block: self.start_block.unwrap_or(0),
-            num_blocks: self.blocks_written,
-        })
+        Ok(RunMeta { block_ids: self.block_ids })
     }
 }
 
@@ -718,10 +721,7 @@ fn write_rows_to_scratch<R: BufRead, W: Write>(
     bi: &mut BlockInterface<R, W>,
 ) -> Result<RunMeta> {
     if rows.is_empty() {
-        return Ok(RunMeta {
-            start_block: 0,
-            num_blocks: 0,
-        });
+        return Ok(RunMeta { block_ids: Vec::new() });
     }
     let mut writer = RunWriter::new(bi.block_size);
     for row in rows {
@@ -733,11 +733,12 @@ fn write_rows_to_scratch<R: BufRead, W: Write>(
 // ─── RunReader ────────────────────────────────────────────────────────────
 
 /// Reads rows sequentially from a sorted run on scratch disk.
+/// Uses the explicit block_ids list from RunMeta — no contiguity assumed.
 struct RunReader {
-    run: RunMeta,
+    block_ids: Vec<u64>, // actual block IDs, in order
     col_types: Vec<DataType>,
-    block_offset: u64,  // 0-based index within the run
-    block_buf: Vec<u8>, // holds the currently-loaded block
+    block_offset: usize, // index into block_ids
+    block_buf: Vec<u8>,
     rows_in_block: usize,
     row_cursor: usize,
     byte_cursor: usize,
@@ -747,9 +748,9 @@ struct RunReader {
 
 impl RunReader {
     fn new(run: RunMeta, col_types: Vec<DataType>, block_size: usize) -> Self {
-        let done = run.num_blocks == 0;
+        let done = run.is_empty();
         Self {
-            run,
+            block_ids: run.block_ids,
             col_types,
             block_offset: 0,
             block_buf: vec![0u8; block_size],
@@ -768,15 +769,13 @@ impl RunReader {
         if self.done {
             return Ok(None);
         }
-        // Load the first block on first call
         if !self.initialized {
             self.load_block(bi)?;
             self.initialized = true;
         }
-        // Advance to next block when this one is exhausted
         while self.row_cursor >= self.rows_in_block {
             self.block_offset += 1;
-            if self.block_offset >= self.run.num_blocks {
+            if self.block_offset >= self.block_ids.len() {
                 self.done = true;
                 return Ok(None);
             }
@@ -788,7 +787,8 @@ impl RunReader {
     }
 
     fn load_block<R: BufRead, W: Write>(&mut self, bi: &mut BlockInterface<R, W>) -> Result<()> {
-        let block_id = self.run.start_block + self.block_offset;
+        // Look up the actual block ID — do not assume contiguity.
+        let block_id = self.block_ids[self.block_offset];
         bi.read_blocks(block_id, 1, &mut self.block_buf)?;
         let bs = bi.block_size;
         self.rows_in_block =
@@ -858,17 +858,28 @@ fn merge_two_runs<R: BufRead, W: Write>(
 // CROSS — nested-loop cartesian product
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// CrossIter materializes the RIGHT child in memory, then streams the LEFT child.
-/// For each left row it pairs it with every right row.
-/// Memory: O(|right|) — only the right side lives in RAM.
+/// CrossIter computes the Cartesian product of left and right.
+///
+/// The right child is spilled to scratch disk during the build phase so that
+/// memory usage stays O(block_size) regardless of how many rows the right side
+/// produces.  For each left row we create a fresh RunReader that streams the
+/// right side from disk from the beginning.  Small right sides (a few blocks)
+/// are served from the LRU block cache, so the disk overhead is negligible.
 pub struct CrossIter {
     pub schema: Schema,
     left: RowIter,
     right_child: Option<Box<RowIter>>,
-    right_rows: Vec<Row>,
+    /// Scratch run holding all right-side rows.
+    right_run: RunMeta,
+    /// Column types inferred from the first right row (needed by RunReader).
+    right_col_types: Vec<DataType>,
+    /// Current left row being paired with the entire right side.
     current_left: Option<Row>,
-    right_idx: usize,
+    /// Reader scanning the right side for the current left row.
+    right_reader: Option<RunReader>,
     built: bool,
+    /// Set to true once right_run blocks have been returned to the free list.
+    right_freed: bool,
 }
 
 impl CrossIter {
@@ -876,41 +887,84 @@ impl CrossIter {
         &mut self,
         bi: &mut BlockInterface<R, W>,
     ) -> Result<Option<Row>> {
-        // Materialize the right child on the very first call
+        // ── Build phase: spill entire right child to scratch disk ─────────────
         if !self.built {
             let mut right_child = self.right_child.take().unwrap();
+            let mut writer = RunWriter::new(bi.block_size);
             while let Some(row) = right_child.next_row(bi)? {
-                self.right_rows.push(row);
+                if self.right_col_types.is_empty() {
+                    self.right_col_types = infer_col_types(&row);
+                }
+                writer.push_row(&row, bi)?;
             }
+            self.right_run = writer.finish(bi)?;
             self.built = true;
+
+            // Empty right side → no output at all.
+            if self.right_run.is_empty() {
+                return Ok(None);
+            }
+
             self.current_left = self.left.next_row(bi)?;
-            self.right_idx = 0;
+            // Prime the right-side reader for the first left row.
+            let block_size = bi.block_size;
+            self.right_reader = Some(RunReader::new(
+                self.right_run.clone(),
+                self.right_col_types.clone(),
+                block_size,
+            ));
         }
 
-        if self.right_rows.is_empty() {
+        // Empty right side (checked once after build)
+        if self.right_run.is_empty() {
             return Ok(None);
         }
 
+        // ── Probe phase ───────────────────────────────────────────────────────
         loop {
-            // Move to next left row when all right rows for current left are done
-            if self.right_idx >= self.right_rows.len() {
-                self.current_left = self.left.next_row(bi)?;
-                self.right_idx = 0;
-            }
             if self.current_left.is_none() {
+                self.free_right_run(bi);
                 return Ok(None);
             }
-            // Build joined row (left values ++ right values)
-            let joined = {
-                let left_row = self.current_left.as_ref().unwrap();
-                let right_row = &self.right_rows[self.right_idx];
-                let mut j = Vec::with_capacity(left_row.len() + right_row.len());
-                j.extend_from_slice(left_row);
-                j.extend_from_slice(right_row);
-                j
+
+            let right_row = match self.right_reader.as_mut() {
+                None => None,
+                Some(r) => r.next_row(bi)?,
             };
-            self.right_idx += 1;
-            return Ok(Some(joined));
+
+            match right_row {
+                Some(rr) => {
+                    let lr = self.current_left.as_ref().unwrap();
+                    let mut joined = Vec::with_capacity(lr.len() + rr.len());
+                    joined.extend_from_slice(lr);
+                    joined.extend_from_slice(&rr);
+                    return Ok(Some(joined));
+                }
+                None => {
+                    // Right side exhausted for this left row — advance left.
+                    self.current_left = self.left.next_row(bi)?;
+                    if self.current_left.is_none() {
+                        self.free_right_run(bi);
+                        return Ok(None);
+                    }
+                    let block_size = bi.block_size;
+                    self.right_reader = Some(RunReader::new(
+                        self.right_run.clone(),
+                        self.right_col_types.clone(),
+                        block_size,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Return all right_run scratch blocks to the free list (called once on exhaustion).
+    fn free_right_run<R: BufRead, W: Write>(&mut self, bi: &mut BlockInterface<R, W>) {
+        if !self.right_freed {
+            for &id in &self.right_run.block_ids {
+                bi.free_scratch_block(id);
+            }
+            self.right_freed = true;
         }
     }
 }
@@ -1037,36 +1091,34 @@ impl HashJoinIter {
 // BLOCK NESTED LOOP JOIN — for non-equi join conditions
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// BNLJoinIter performs a nested-loop join with the right side materialised once.
+/// BNLJoinIter performs a nested-loop join for non-equi join conditions
+/// (e.g. `a.price < b.price`) where hash join is not applicable.
 ///
-/// This is used when there are no equi-join conditions (e.g. `a.price < b.price`),
-/// so hash join is not applicable.
+/// The right side is spilled to scratch disk during the build phase so that
+/// memory usage stays O(block_size) no matter how large the right relation is.
+/// For each left row we create a fresh RunReader to re-scan the right side.
+/// Small right sides are served from the LRU block cache.
 ///
-/// Algorithm:
-///   Build — materialise the entire right child in memory (same as CrossIter).
-///   Probe — for each left row, iterate over all right rows and emit pairs that
-///           satisfy all join predicates.
-///
-/// The "block" in the name refers to the fact that in a true BNL join the left
-/// side is also loaded in blocks to improve cache locality.  In the Volcano
-/// iterator model we process one left row at a time, which is equivalent when
-/// the right side is already in memory.
-///
-/// Memory: O(|right|).
+/// Memory: O(block_size) per side.
 pub struct BNLJoinIter {
     pub schema: Schema,
     /// All join predicates (cross-table, non-equi or mixed).
     predicates: Vec<Predicate>,
-    /// Left child — streamed.
+    /// Left child — streamed one row at a time.
     left: RowIter,
-    /// Right child — materialised into `right_rows` on the first call.
+    /// Right child — consumed during build, then set to None.
     right_child: Option<Box<RowIter>>,
-    right_rows: Vec<Row>,
+    /// Scratch run holding all right-side rows.
+    right_run: RunMeta,
+    /// Column types inferred from the first right row (needed by RunReader).
+    right_col_types: Vec<DataType>,
     built: bool,
-    /// Current left row.
+    /// Current left row being probed against the entire right side.
     current_left: Option<Row>,
-    /// Index into `right_rows` for the current left row.
-    right_idx: usize,
+    /// Reader scanning the right side for the current left row.
+    right_reader: Option<RunReader>,
+    /// Set to true once right_run blocks have been returned to the free list.
+    right_freed: bool,
 }
 
 impl BNLJoinIter {
@@ -1074,44 +1126,84 @@ impl BNLJoinIter {
         &mut self,
         bi: &mut BlockInterface<R, W>,
     ) -> Result<Option<Row>> {
-        // ── Build phase: materialise right side ───────────────────────────────
+        // ── Build phase: spill entire right child to scratch disk ─────────────
         if !self.built {
             let mut right_child = self.right_child.take().unwrap();
+            let mut writer = RunWriter::new(bi.block_size);
             while let Some(row) = right_child.next_row(bi)? {
-                self.right_rows.push(row);
+                if self.right_col_types.is_empty() {
+                    self.right_col_types = infer_col_types(&row);
+                }
+                writer.push_row(&row, bi)?;
             }
+            self.right_run = writer.finish(bi)?;
             self.built = true;
+
+            // Empty right side → no output.
+            if self.right_run.is_empty() {
+                return Ok(None);
+            }
+
             self.current_left = self.left.next_row(bi)?;
-            self.right_idx = 0;
+            let block_size = bi.block_size;
+            self.right_reader = Some(RunReader::new(
+                self.right_run.clone(),
+                self.right_col_types.clone(),
+                block_size,
+            ));
         }
 
-        if self.right_rows.is_empty() {
+        // Empty right side (checked once after build)
+        if self.right_run.is_empty() {
             return Ok(None);
         }
 
         // ── Probe phase ───────────────────────────────────────────────────────
         loop {
-            // Advance to the next left row when all right rows are exhausted.
-            if self.right_idx >= self.right_rows.len() {
-                self.current_left = self.left.next_row(bi)?;
-                self.right_idx = 0;
-            }
             if self.current_left.is_none() {
+                self.free_right_run(bi);
                 return Ok(None);
             }
 
-            let left_row = self.current_left.as_ref().unwrap();
-            let right_row = &self.right_rows[self.right_idx];
-            self.right_idx += 1;
+            let right_row = match self.right_reader.as_mut() {
+                None => None,
+                Some(r) => r.next_row(bi)?,
+            };
 
-            // Build combined row (left ++ right) to evaluate predicates.
-            let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
-            joined.extend_from_slice(left_row);
-            joined.extend_from_slice(right_row);
+            match right_row {
+                Some(rr) => {
+                    let lr = self.current_left.as_ref().unwrap();
+                    let mut joined = Vec::with_capacity(lr.len() + rr.len());
+                    joined.extend_from_slice(lr);
+                    joined.extend_from_slice(&rr);
 
-            if row_passes_all_predicates(&joined, &self.predicates, &self.schema)? {
-                return Ok(Some(joined));
+                    if row_passes_all_predicates(&joined, &self.predicates, &self.schema)? {
+                        return Ok(Some(joined));
+                    }
+                }
+                None => {
+                    self.current_left = self.left.next_row(bi)?;
+                    if self.current_left.is_none() {
+                        self.free_right_run(bi);
+                        return Ok(None);
+                    }
+                    let block_size = bi.block_size;
+                    self.right_reader = Some(RunReader::new(
+                        self.right_run.clone(),
+                        self.right_col_types.clone(),
+                        block_size,
+                    ));
+                }
             }
+        }
+    }
+
+    fn free_right_run<R: BufRead, W: Write>(&mut self, bi: &mut BlockInterface<R, W>) {
+        if !self.right_freed {
+            for &id in &self.right_run.block_ids {
+                bi.free_scratch_block(id);
+            }
+            self.right_freed = true;
         }
     }
 }
@@ -1464,10 +1556,12 @@ pub fn build_plan(op: &QueryOp, ctx: &DbContext, memory_limit_mb: u64) -> Result
                 schema,
                 left,
                 right_child: Some(Box::new(right)),
-                right_rows: Vec::new(),
+                right_run: RunMeta { block_ids: Vec::new() },
+                right_col_types: Vec::new(),
                 current_left: None,
-                right_idx: 0,
+                right_reader: None,
                 built: false,
+                right_freed: false,
             })))
         }
     }
@@ -1533,10 +1627,12 @@ fn build_join(
             predicates: predicates.to_vec(),
             left: left_plan,
             right_child: Some(Box::new(right_plan)),
-            right_rows: Vec::new(),
+            right_run: RunMeta { block_ids: Vec::new() },
+            right_col_types: Vec::new(),
             built: false,
             current_left: None,
-            right_idx: 0,
+            right_reader: None,
+            right_freed: false,
         })));
     }
 
@@ -1598,7 +1694,15 @@ fn build_join(
     // u64::MAX, which always exceeds the budget → safe conservative fallback.
     let build_card = estimated_cardinality(right_op, ctx);
     let memory_limit_bytes = (memory_limit_mb as u64).saturating_mul(1024 * 1024);
-    if build_card.saturating_mul(512) > memory_limit_bytes {
+    // Per-row estimate accounts for schema width: each column costs ~128 bytes
+    // (Data enum + HashMap overhead + Vec bookkeeping), plus 128 bytes of base
+    // HashMap entry cost.  Only 40% of the memory budget is reserved for the
+    // hash table — the remaining 60% covers: sort chunks (≤25%), LRU cache
+    // (≤12.5%), and general executor / stack overhead.
+    let build_schema_width = schema_of(right_op, ctx).len() as u64;
+    let bytes_per_row = build_schema_width.saturating_mul(128).saturating_add(128);
+    let hash_budget = memory_limit_bytes.saturating_mul(40) / 100;
+    if build_card.saturating_mul(bytes_per_row) > hash_budget {
         let left_key_cols: Vec<String> = {
             let s = schema_of(left_op, ctx);
             equi_keys.iter().map(|(li, _)| s[*li].clone()).collect()
